@@ -1421,27 +1421,35 @@ static void XInputRead(void)
 	}
 	else if(XInputPacket[0] == 0x00 && XInputPacket[1] == XINPUT_REPORT_SIZE)
 	{
+		s16 rawlx, rawly, rawrx, rawry;
 		s16 lx, ly, rx, ry;
 
 		XInputErrors = 0;
 
-		lx = (s16)((u16)XInputPacket[6]  | ((u16)XInputPacket[7]  << 8));
-		ly = (s16)((u16)XInputPacket[8]  | ((u16)XInputPacket[9]  << 8));
-		rx = (s16)((u16)XInputPacket[10] | ((u16)XInputPacket[11] << 8));
-		ry = (s16)((u16)XInputPacket[12] | ((u16)XInputPacket[13] << 8));
+		rawlx = (s16)((u16)XInputPacket[6]  | ((u16)XInputPacket[7]  << 8));
+		rawly = (s16)((u16)XInputPacket[8]  | ((u16)XInputPacket[9]  << 8));
+		rawrx = (s16)((u16)XInputPacket[10] | ((u16)XInputPacket[11] << 8));
+		rawry = (s16)((u16)XInputPacket[12] | ((u16)XInputPacket[13] << 8));
+
+		lx = rawlx; ly = rawly;
+		rx = rawrx; ry = rawry;
 
 		if(XInputHavePrev)
 		{
-			if(XInputAxisSpiked(lx, XInPrevLX) || XInputAxisSpiked(ly, XInPrevLY) ||
-			   XInputAxisSpiked(rx, XInPrevRX) || XInputAxisSpiked(ry, XInPrevRY))
+			if(XInputAxisSpiked(rawlx, XInPrevLX) || XInputAxisSpiked(rawly, XInPrevLY) ||
+			   XInputAxisSpiked(rawrx, XInPrevRX) || XInputAxisSpiked(rawry, XInPrevRY))
 			{
-				/* Hold the last good position, but not indefinitely. */
+				/* Hold the last good position, but never indefinitely: after
+				 * XINPUT_SPIKE_MAX_RUN held samples take the new values, or a
+				 * pad that settles far from where it was would stay frozen and
+				 * the sticks would simply stop responding. */
 				lx = XInPrevLX; ly = XInPrevLY;
 				rx = XInPrevRX; ry = XInPrevRY;
 				if(++XInputSpikeRun > XINPUT_SPIKE_MAX_RUN)
 				{
 					XInputSpikeRun = 0;
-					XInputHavePrev = 0;
+					lx = rawlx; ly = rawly;
+					rx = rawrx; ry = rawry;
 				}
 			}
 			else
