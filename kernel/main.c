@@ -71,6 +71,79 @@ u32 drcAddressAligned = 0;
 bool isWiiVC = false;
 bool wiiVCInternal = false;
 bool isWidescreen = false;
+/*
+ * On-screen overlay, first milestone.
+ *
+ * Nintendont has no drawing code once a game is running: all of its UI is
+ * GRRLIB in the PPC loader, which is gone by then. The per-frame PPC hook
+ * (PADReadGC) can't take on drawing either - it is 11843 bytes into a hard
+ * 12288 byte budget, and an 8x8 font alone is larger than what is left.
+ *
+ * So the work is split. PADRead publishes VI_TFBL, which costs it two
+ * instructions, and the ARM side - which has room - decodes that into the
+ * game's external framebuffer and draws into it directly. The ARM already
+ * writes MEM1 elsewhere (the OSReport area at 0x1860), so this is not new
+ * ground.
+ *
+ * This milestone only proves the pointer is right and that writing to the
+ * frame is safe: it paints one small block. Menus, fonts and input come later,
+ * and only if this holds up on hardware.
+ *
+ * The XFB is YUY2 - Y0 Cb Y1 Cr, two bytes per pixel, 1280 bytes per line at
+ * 640 pixels wide - so a 32-bit store covers two pixels.
+ */
+#define OSD_XFB_SLOT    0x132C3000  /* PADRead writes VI_TFBL here every frame */
+#define OSD_LINE_BYTES  1280
+#define OSD_PIXEL_PAIR  0xEB80EB80  /* Y=0xEB Cb=0x80 Y=0xEB Cr=0x80: white */
+
+static u32 OSD_Timer = 0;
+
+/* Decode VI_TFBL into a physical MEM1 address, or 0 if it looks implausible. */
+static u32 OSDFramebuffer(void)
+{
+	u32 val, addr;
+
+	sync_before_read((void*)OSD_XFB_SLOT, 0x20);
+	val = read32(OSD_XFB_SLOT);
+	if(val == 0)
+		return 0;
+
+	/* Bit 28 set means the address field is stored shifted right by five. */
+	if(val & 0x10000000)
+		addr = (val & 0x00FFFFFF) << 5;
+	else
+		addr = val & 0x00FFFFFF;
+
+	/* Refuse anything that is not plausibly a framebuffer. Writing to a bad
+	 * address here would corrupt the running game. */
+	if(addr < 0x00010000 || addr >= 0x01800000 || (addr & 31))
+		return 0;
+
+	return addr;
+}
+
+static void OSDUpdate(void)
+{
+	u32 xfb, y;
+
+	/* ~30 Hz is plenty and keeps this off the hot path of the kernel loop. */
+	if(TimerDiffTicks(OSD_Timer) < 63000)
+		return;
+	OSD_Timer = read32(HW_TIMER);
+
+	xfb = OSDFramebuffer();
+	if(xfb == 0)
+		return;
+
+	for(y = 32; y < 48; ++y)
+	{
+		u32 line = xfb + (y * OSD_LINE_BYTES) + (32 * 2);
+		u32 x;
+		for(x = 0; x < 64; x += 2)
+			write32(line + (x * 2), OSD_PIXEL_PAIR);
+		sync_after_write((void*)line, 128);
+	}
+}
 int _main( int argc, char *argv[] )
 {
 	//BSS is in DATA section so IOS doesnt touch it, we need to manually clear it
@@ -467,6 +540,7 @@ int _main( int argc, char *argv[] )
 		GCAMUpdateRegisters();
 		BTUpdateRegisters();
 		HIDUpdateRegisters(0);
+		OSDUpdate();
 		if(DisableSIPatch == 0) SIUpdateRegisters();
 		#endif
 		if(bbaEmuWanted)

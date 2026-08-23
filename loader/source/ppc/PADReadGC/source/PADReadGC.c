@@ -92,6 +92,13 @@ u32 PADRead(u32 calledByGame)
 	u32 Rumble = 0, memInvalidate, memFlush;
 	u32 used = 0;
 
+	/* Publish the current external framebuffer address so the ARM side can draw
+	 * an overlay on it. VI_TFBL is read straight from the video registers and
+	 * stored to uncached MEM2, so no flush is needed. Deliberately two
+	 * instructions: this blob has a hard 0x3000 byte budget. */
+	if(calledByGame)
+		*(vu32*)0xD32C3000 = *(vu32*)0xCC00201C;
+
 	PADStatus *Pad = (PADStatus*)(0x93003100); //PadBuff
 	u32 MaxPads;
 	if(calledByGame)
