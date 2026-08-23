@@ -23,6 +23,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "Config.h"
 #include "hidmem.h"
 #include "usb.h"
+#include "usbstorage.h"
 #include "HID_controllers.h"
 
 #include <stdlib.h>
@@ -1447,6 +1448,7 @@ static bool XInputCheckProfileCombo(const u8 *Report)
 static bool XInputOpen(void)
 {
 	bool opened = false;
+	s32 StorageID = USBStorage_GetDeviceID();
 	s32 *io_buffer = (s32*)malloca(0x20, 32);
 	u8 *Heap = (u8*)malloca(0xC0, 32);
 	u32 i;
@@ -1469,11 +1471,14 @@ static bool XInputOpen(void)
 		 * interface class 0xFF / subclass 0x5D / protocol 0x01 regardless of who
 		 * made it, so this picks up third-party pads and clones too.
 		 *
-		 * GetDeviceParameters is read-only, so it is safe to call on anything in
-		 * the list - including the mass storage device the game is loading from.
-		 * Nothing is attached, resumed or reconfigured until the descriptors say
-		 * the device really is an XInput pad.
+		 * The storage device is skipped outright. The list is shared with the
+		 * drive the game is streaming from, and while GetDeviceParameters is
+		 * read-only, the retry path below resumes a device that does not answer -
+		 * which is emphatically not something to do to a disc in use.
 		 */
+		if(StorageID != 0 && XInputDeviceID == StorageID)
+			continue;
+
 		memset32(Heap, 0, 0xC0);
 		memset32(io_buffer, 0, 0x20);
 		io_buffer[0] = XInputDeviceID;

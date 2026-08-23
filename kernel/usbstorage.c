@@ -235,6 +235,13 @@ typedef struct
 	u8 ep_out;
 } important_storage_data;
 
+
+/* The USB device id the game is being streamed from. Anything scanning the
+ * shared /dev/usb/ven device list must leave this one alone. */
+s32 USBStorage_GetDeviceID(void)
+{
+	return __usb_fd;
+}
 void USBStorage_Open()
 {
 	sync_before_read((void*)0x132C1000, sizeof(important_storage_data));
