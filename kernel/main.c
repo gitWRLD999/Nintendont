@@ -98,6 +98,7 @@ bool isWidescreen = false;
 
 static u32 OSD_Timer = 0;
 static u32 OSD_LastXFB = 0;
+static u32 OSD_Redraw = 0;
 
 /* Decode VI_TFBL into a physical MEM1 address, or 0 if it looks implausible. */
 static u32 OSDFramebuffer(void)
@@ -127,31 +128,41 @@ static void OSDUpdate(void)
 {
 	u32 xfb, y;
 
+	/*
+	 * Cheap gate first. TimerDiffTicks is a bare register read, but everything
+	 * past this point costs syscalls - the cache maintenance around reading the
+	 * published pointer and flushing what we draw. This runs from the kernel's
+	 * hot loop, which services DI and streaming tens of thousands of times a
+	 * second, so doing syscalls per iteration starves the game and hangs it.
+	 *
+	 * ~1 ms is short enough to notice a buffer flip almost immediately while
+	 * costing three orders of magnitude fewer syscalls than polling every pass.
+	 */
+	if(TimerDiffTicks(OSD_Timer) < 1900)
+		return;
+	OSD_Timer = read32(HW_TIMER);
+
 	xfb = OSDFramebuffer();
 	if(xfb == 0)
 		return;
 
 	/*
-	 * Draw on the flip, not on a timer.
+	 * Draw on the flip. Games are double buffered: VI_TFBL names the buffer
+	 * being scanned out while the game renders into the other one. Painting
+	 * whichever buffer happens to be up lands the overlay on about half the
+	 * frames, which is what made it flicker.
 	 *
-	 * Games are double buffered: VI_TFBL names whichever buffer is being
-	 * scanned out, and the game renders into the other one. Painting on a fixed
-	 * schedule means painting whichever buffer happens to be up, so the overlay
-	 * lands on roughly half the frames and flickers badly.
-	 *
-	 * The moment VI_TFBL changes, a freshly rendered buffer has just become
-	 * visible and the game has moved on to drawing the other one - so that
-	 * buffer is finished, on screen, and will not be touched again until the
-	 * next flip. Writing to it right then keeps the overlay up for the whole
-	 * frame. The gap between the flip and this draw is microseconds.
-	 *
-	 * The timer is a fallback for single buffered games, where the address
-	 * never changes and there is no flip to key off.
+	 * When VI_TFBL changes, a freshly rendered buffer has just become visible
+	 * and the game has moved on to the other one, so it is finished, on screen,
+	 * and will not be touched again until the next flip. At a 1 ms poll the
+	 * overlay goes up within a millisecond of the flip and stays for the rest
+	 * of the frame. Redrawing the same address is harmless and covers single
+	 * buffered games, where there is no flip to key off.
 	 */
-	if(xfb == OSD_LastXFB && TimerDiffTicks(OSD_Timer) < 30000)
+	if(xfb == OSD_LastXFB && TimerDiffTicks(OSD_Redraw) < 30000)
 		return;
 	OSD_LastXFB = xfb;
-	OSD_Timer = read32(HW_TIMER);
+	OSD_Redraw = read32(HW_TIMER);
 
 	for(y = 32; y < 48; ++y)
 	{
@@ -159,8 +170,10 @@ static void OSDUpdate(void)
 		u32 x;
 		for(x = 0; x < 64; x += 2)
 			write32(line + (x * 2), OSD_PIXEL_PAIR);
-		sync_after_write((void*)line, 128);
 	}
+	/* One flush over the whole block rather than one per row: same effect,
+	 * a fraction of the syscalls. */
+	sync_after_write((void*)(xfb + (32 * OSD_LINE_BYTES)), 16 * OSD_LINE_BYTES);
 }
 int _main( int argc, char *argv[] )
 {
