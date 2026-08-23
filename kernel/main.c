@@ -97,6 +97,7 @@ bool isWidescreen = false;
 #define OSD_PIXEL_PAIR  0xEB80EB80  /* Y=0xEB Cb=0x80 Y=0xEB Cr=0x80: white */
 
 static u32 OSD_Timer = 0;
+static u32 OSD_LastXFB = 0;
 
 /* Decode VI_TFBL into a physical MEM1 address, or 0 if it looks implausible. */
 static u32 OSDFramebuffer(void)
@@ -126,14 +127,31 @@ static void OSDUpdate(void)
 {
 	u32 xfb, y;
 
-	/* ~30 Hz is plenty and keeps this off the hot path of the kernel loop. */
-	if(TimerDiffTicks(OSD_Timer) < 63000)
-		return;
-	OSD_Timer = read32(HW_TIMER);
-
 	xfb = OSDFramebuffer();
 	if(xfb == 0)
 		return;
+
+	/*
+	 * Draw on the flip, not on a timer.
+	 *
+	 * Games are double buffered: VI_TFBL names whichever buffer is being
+	 * scanned out, and the game renders into the other one. Painting on a fixed
+	 * schedule means painting whichever buffer happens to be up, so the overlay
+	 * lands on roughly half the frames and flickers badly.
+	 *
+	 * The moment VI_TFBL changes, a freshly rendered buffer has just become
+	 * visible and the game has moved on to drawing the other one - so that
+	 * buffer is finished, on screen, and will not be touched again until the
+	 * next flip. Writing to it right then keeps the overlay up for the whole
+	 * frame. The gap between the flip and this draw is microseconds.
+	 *
+	 * The timer is a fallback for single buffered games, where the address
+	 * never changes and there is no flip to key off.
+	 */
+	if(xfb == OSD_LastXFB && TimerDiffTicks(OSD_Timer) < 30000)
+		return;
+	OSD_LastXFB = xfb;
+	OSD_Timer = read32(HW_TIMER);
 
 	for(y = 32; y < 48; ++y)
 	{
