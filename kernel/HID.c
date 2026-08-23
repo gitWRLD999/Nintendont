@@ -1101,11 +1101,19 @@ static void KeyboardRead()
  * say never returns and hangs the console.
  */
 
-#define XINPUT_VID              0x045e
-#define XINPUT_PID              0x028e
 #define XINPUT_REPORT_SIZE      20
 #define XINPUT_ATTACH           4
 #define XINPUT_CANCEL_ENDPOINT  17
+
+/* The XInput interface signature, identical across every vendor. */
+#define XINPUT_CLASS            0xFF
+#define XINPUT_SUBCLASS         0x5D
+#define XINPUT_PROTOCOL         0x01
+
+/* Stick shaping for the built-in mapping. Radius is pre-adjusted for the dead
+ * zone exactly as the .ini parser does: Radius * 1280 / (128 - DeadZone). */
+#define XINPUT_STICK_DEADZONE   0x1A
+#define XINPUT_STICK_ADJ_RADIUS (100 * 1280 / (128 - XINPUT_STICK_DEADZONE))
 
 /*
  * Reject any sample whose stick position moves further in one report than a
@@ -1201,6 +1209,7 @@ static bool XInputParseDescriptors(const u8 *Heap)
 	u32 Offset = 20;
 	u32 DeviceDescLength, ConfigurationLength, InterfaceDescLength;
 	u32 bInterfaceNumber, bNumEndpoints, i;
+	u32 bInterfaceClass, bInterfaceSubClass, bInterfaceProtocol;
 
 	DeviceDescLength = *(vu8*)(Heap+Offset);
 	Offset += (DeviceDescLength+3)&(~3);
@@ -1214,6 +1223,16 @@ static bool XInputParseDescriptors(const u8 *Heap)
 
 	bInterfaceNumber = *(vu8*)(Heap+Offset+2);
 	bNumEndpoints = *(vu8*)(Heap+Offset+4);
+	bInterfaceClass = *(vu8*)(Heap+Offset+5);
+	bInterfaceSubClass = *(vu8*)(Heap+Offset+6);
+	bInterfaceProtocol = *(vu8*)(Heap+Offset+7);
+
+	/* This is what actually identifies an XInput pad. Bail before touching
+	 * anything if the interface is not one - the caller walks every device on
+	 * the shared handle, including the drive the game is loading from. */
+	if(bInterfaceNumber != 0 || bInterfaceClass != XINPUT_CLASS ||
+		bInterfaceSubClass != XINPUT_SUBCLASS || bInterfaceProtocol != XINPUT_PROTOCOL)
+		return false;
 	Offset += (InterfaceDescLength+3)&(~3);
 
 	/* Skip class or vendor specific descriptors sitting between the interface
@@ -1257,7 +1276,7 @@ static bool XInputParseDescriptors(const u8 *Heap)
 		Offset += (EndpointLength+3)&(~3);
 	}
 
-	if(bInterfaceNumber != 0 || XInputEpIn == 0)
+	if(XInputEpIn == 0)
 		return false;
 
 	/* Clamp: a bad length here would allocate a useless packet buffer. */
@@ -1265,6 +1284,68 @@ static bool XInputParseDescriptors(const u8 *Heap)
 		wMaxPacketSize = 32;
 
 	return true;
+}
+
+/*
+ * Fill in the standard XInput mapping.
+ *
+ * The XInput report layout is fixed by the protocol, so one mapping is correct
+ * for every pad that speaks it and no .ini is needed. A matching
+ * /controllers/VVVV_PPPP.ini still wins if the user wants something else.
+ *
+ *   byte 2  d-pad, start, back, stick clicks
+ *   byte 3  shoulders, guide, face buttons
+ *   byte 4  left trigger        byte 5  right trigger
+ *   6/7 LX  8/9 LY  10/11 RX  12/13 RY   (normalised to one byte each below)
+ */
+static void XInputSetDefaultConfig(u32 DeviceVID, u32 DevicePID)
+{
+	memset32(HID_CTRL, 0, sizeof(controller));
+
+	HID_CTRL->VID = DeviceVID;
+	HID_CTRL->PID = DevicePID;
+	HID_CTRL->Polltype = 1;
+	HID_CTRL->DPAD = 0;
+	HID_CTRL->DigitalLR = 2;
+	HID_CTRL->MultiIn = 0;
+
+	HID_CTRL->A.Offset = 3; HID_CTRL->A.Mask = 0x10;
+	HID_CTRL->B.Offset = 3; HID_CTRL->B.Mask = 0x20;
+	HID_CTRL->X.Offset = 3; HID_CTRL->X.Mask = 0x40;
+	HID_CTRL->Y.Offset = 3; HID_CTRL->Y.Mask = 0x80;
+
+	/* Right bumper is the GameCube Z shoulder button. */
+	HID_CTRL->Z.Offset = 3; HID_CTRL->Z.Mask = 0x02;
+	HID_CTRL->ZL.Offset = 0; HID_CTRL->ZL.Mask = 0x00;
+
+	HID_CTRL->S.Offset = 2; HID_CTRL->S.Mask = 0x10;
+
+	HID_CTRL->Up.Offset = 2; HID_CTRL->Up.Mask = 0x01;
+	HID_CTRL->Down.Offset = 2; HID_CTRL->Down.Mask = 0x02;
+	HID_CTRL->Left.Offset = 2; HID_CTRL->Left.Mask = 0x04;
+	HID_CTRL->Right.Offset = 2; HID_CTRL->Right.Mask = 0x08;
+
+	/* Analog triggers, with a digital click near the end of travel. */
+	HID_CTRL->L.Offset = 4; HID_CTRL->L.Mask = 0xE0;
+	HID_CTRL->R.Offset = 5; HID_CTRL->R.Mask = 0xE0;
+	HID_CTRL->LAnalog = 4;
+	HID_CTRL->RAnalog = 5;
+
+	HID_CTRL->StickX.Offset = 6;
+	HID_CTRL->StickY.Offset = 7;
+	HID_CTRL->CStickX.Offset = 8;
+	HID_CTRL->CStickY.Offset = 9;
+	HID_CTRL->StickX.DeadZone = XINPUT_STICK_DEADZONE;
+	HID_CTRL->StickY.DeadZone = XINPUT_STICK_DEADZONE;
+	HID_CTRL->CStickX.DeadZone = XINPUT_STICK_DEADZONE;
+	HID_CTRL->CStickY.DeadZone = XINPUT_STICK_DEADZONE;
+	HID_CTRL->StickX.Radius = XINPUT_STICK_ADJ_RADIUS;
+	HID_CTRL->StickY.Radius = XINPUT_STICK_ADJ_RADIUS;
+	HID_CTRL->CStickX.Radius = XINPUT_STICK_ADJ_RADIUS;
+	HID_CTRL->CStickY.Radius = XINPUT_STICK_ADJ_RADIUS;
+
+	/* Guide deliberately unmapped: a zero mask disables the exit combo. */
+	HID_CTRL->Power.Offset = 0; HID_CTRL->Power.Mask = 0x00;
 }
 
 /* Bring up the first XInput pad in the device list and start reading it. */
@@ -1280,14 +1361,52 @@ static bool XInputOpen(void)
 
 	for(i = 0; i < 32; ++i)
 	{
-		if(XInputDevices[i].vid != XINPUT_VID || XInputDevices[i].pid != XINPUT_PID)
+		u32 DeviceVID = XInputDevices[i].vid;
+		u32 DevicePID = XInputDevices[i].pid;
+
+		if(DeviceVID == 0 && XInputDevices[i].device_id == 0)
 			continue;
 
 		XInputDeviceID = XInputDevices[i].device_id;
-		dbgprintf("HID:XInput device %u\r\n", XInputDeviceID);
 
-		/* Claim the device for this handle, then resume it. IOS refuses
-		 * GetDeviceParameters on a suspended device. */
+		/*
+		 * Identify by descriptor, not by VID/PID. Every XInput device declares
+		 * interface class 0xFF / subclass 0x5D / protocol 0x01 regardless of who
+		 * made it, so this picks up third-party pads and clones too.
+		 *
+		 * GetDeviceParameters is read-only, so it is safe to call on anything in
+		 * the list - including the mass storage device the game is loading from.
+		 * Nothing is attached, resumed or reconfigured until the descriptors say
+		 * the device really is an XInput pad.
+		 */
+		memset32(Heap, 0, 0xC0);
+		memset32(io_buffer, 0, 0x20);
+		io_buffer[0] = XInputDeviceID;
+		io_buffer[2] = 0;
+		if(IOS_Ioctl(XInputHandle, GetDeviceParameters, io_buffer, 0x20, Heap, 0xC0) < 0)
+		{
+			/* Suspended devices refuse GetDeviceParameters; wake it and retry
+			 * once. Resume on an already-running device just returns an error. */
+			memset32(io_buffer, 0, 0x20);
+			io_buffer[0] = XInputDeviceID;
+			io_buffer[2] = 1;
+			IOS_Ioctl(XInputHandle, ResumeDevice, io_buffer, 0x20, NULL, 0);
+
+			memset32(Heap, 0, 0xC0);
+			memset32(io_buffer, 0, 0x20);
+			io_buffer[0] = XInputDeviceID;
+			io_buffer[2] = 0;
+			if(IOS_Ioctl(XInputHandle, GetDeviceParameters, io_buffer, 0x20, Heap, 0xC0) < 0)
+				continue;
+		}
+
+		if(!XInputParseDescriptors(Heap))
+			continue;
+
+		dbgprintf("HID:XInput %04X:%04X ep in %02X out %02X size %u\r\n",
+			DeviceVID, DevicePID, XInputEpIn, XInputEpOut, wMaxPacketSize);
+
+		/* Confirmed XInput: now it is safe to claim and configure it. */
 		memset32(io_buffer, 0, 0x20);
 		io_buffer[0] = XInputDeviceID;
 		IOS_Ioctl(XInputHandle, XINPUT_ATTACH, io_buffer, 0x20, NULL, 0);
@@ -1297,23 +1416,14 @@ static bool XInputOpen(void)
 		io_buffer[2] = 1;
 		IOS_Ioctl(XInputHandle, ResumeDevice, io_buffer, 0x20, NULL, 0);
 
-		memset32(Heap, 0, 0xC0);
-		memset32(io_buffer, 0, 0x20);
-		io_buffer[0] = XInputDeviceID;
-		io_buffer[2] = 0;
-		if(IOS_Ioctl(XInputHandle, GetDeviceParameters, io_buffer, 0x20, Heap, 0xC0) < 0)
-			continue;
-
-		if(!XInputParseDescriptors(Heap))
-			continue;
-
-		dbgprintf("HID:XInput ep in %02X out %02X size %u\r\n",
-			XInputEpIn, XInputEpOut, wMaxPacketSize);
-
-		if(!HIDLoadControllerConfig(XINPUT_VID, XINPUT_PID, 0))
-			continue;
-		if(HID_CTRL->VID != XINPUT_VID || HID_CTRL->PID != XINPUT_PID)
-			continue;
+		/* A matching .ini overrides the built-in mapping; otherwise the
+		 * protocol-defined layout is used, so any XInput pad works untouched. */
+		if(!HIDLoadControllerConfig(DeviceVID, DevicePID, 0) ||
+			HID_CTRL->VID != DeviceVID || HID_CTRL->PID != DevicePID)
+		{
+			dbgprintf("HID:XInput using built-in mapping\r\n");
+			XInputSetDefaultConfig(DeviceVID, DevicePID);
+		}
 
 		sync_after_write(HID_CTRL, (sizeof(controller)+31)&(~31));
 
