@@ -153,7 +153,7 @@ void HIDInit( void )
  * instead of duplicating the whole .ini parser. Returns false when no usable
  * mapping exists, in which case the caller should skip the device.
  */
-static bool HIDLoadControllerConfig(u32 DeviceVID, u32 DevicePID, u32 LoaderRequest, u32 Profile)
+static bool HIDLoadControllerConfig(u32 DeviceVID, u32 DevicePID, u32 LoaderRequest)
 {
 	int ret;
 	//Load controller config
@@ -189,17 +189,11 @@ static bool HIDLoadControllerConfig(u32 DeviceVID, u32 DevicePID, u32 LoaderRequ
 	{
 		FIL f;
 		u32 read;
-		char directory[36];
-		if(Profile > 1)
-			_sprintf(directory, "/controllers/%04X_%04X_%u.ini", DeviceVID, DevicePID, Profile);
-		else
-			_sprintf(directory, "/controllers/%04X_%04X.ini", DeviceVID, DevicePID);
+		char directory[28];
+		_sprintf(directory, "/controllers/%04X_%04X.ini", DeviceVID, DevicePID);
 		dbgprintf("Preferred controller.ini file: %s\r\n", directory);
 		
 		ret = f_open_char( &f, directory, FA_OPEN_EXISTING|FA_READ);
-		/* Numbered profiles are opt-in extras: no generic fallback for them. */
-		if(ret != FR_OK && Profile > 1)
-			return false;
 		if(ret != FR_OK)
 			ret = f_open_char( &f, "/controller.ini", FA_OPEN_EXISTING|FA_READ);
 		else
@@ -579,7 +573,7 @@ s32 HIDOpen( u32 LoaderRequest )
 				else if( DeviceVID == 0x057e && DevicePID == 0x0337 )
 					HIDGCInit();
 
-				if(!HIDLoadControllerConfig(DeviceVID, DevicePID, LoaderRequest, 0))
+				if(!HIDLoadControllerConfig(DeviceVID, DevicePID, LoaderRequest))
 					continue;
 
 				/*
@@ -1355,95 +1349,6 @@ static void XInputSetDefaultConfig(u32 DeviceVID, u32 DevicePID)
 	HID_CTRL->Power.Offset = 0; HID_CTRL->Power.Mask = 0x00;
 }
 
-/*
- * Mapping profiles switchable while a game is running.
- *
- * Profile 1 is /controllers/VVVV_PPPP.ini (or the built-in layout). Profiles 2
- * to 4 are optional /controllers/VVVV_PPPP_2.ini and so on. All of them are
- * read once at bring-up and kept in memory, because switching must not touch
- * the filesystem: the game is streaming from that same device through the same
- * USB handle, and reading a config mid-game is exactly the kind of contention
- * that makes a disc read fail.
- *
- * Back + d-pad right cycles forward, Back + d-pad left cycles back. Back is
- * unmapped in the standard layout so the combo cannot collide with gameplay,
- * and the d-pad is swallowed while Back is held so the game does not see it.
- * The pad's ring of light shows which profile is live.
- */
-#define XINPUT_MAX_PROFILES 4
-
-static controller XInputProfiles[XINPUT_MAX_PROFILES];
-static u32 XInputProfileCount = 1;
-static u32 XInputProfile = 0;
-static u32 XInputComboPrev = 0;
-
-static void XInputLoadProfiles(u32 DeviceVID, u32 DevicePID)
-{
-	u32 p;
-
-	/* HID_CTRL already holds profile 1 when this is called. */
-	memcpy(&XInputProfiles[0], HID_CTRL, sizeof(controller));
-	XInputProfileCount = 1;
-
-	for(p = 2; p <= XINPUT_MAX_PROFILES; ++p)
-	{
-		if(!HIDLoadControllerConfig(DeviceVID, DevicePID, 0, p))
-			break;
-		if(HID_CTRL->VID != DeviceVID || HID_CTRL->PID != DevicePID)
-			break;
-		memcpy(&XInputProfiles[XInputProfileCount], HID_CTRL, sizeof(controller));
-		XInputProfileCount++;
-	}
-
-	/* Leave profile 1 active regardless of what the loop parsed last. */
-	memcpy(HID_CTRL, &XInputProfiles[0], sizeof(controller));
-	XInputProfile = 0;
-	XInputComboPrev = 0;
-	dbgprintf("HID:XInput %u mapping profile(s)\r\n", XInputProfileCount);
-}
-
-/* Returns true while the modifier is held, so the caller can hide the d-pad. */
-static bool XInputCheckProfileCombo(const u8 *Report)
-{
-	u32 back, combo;
-
-	if(XInputProfileCount <= 1)
-		return false;
-
-	back = Report[2] & 0x20;
-	combo = 0;
-	if(back)
-	{
-		if(Report[2] & 0x08)
-			combo = 1;      /* d-pad right - next */
-		else if(Report[2] & 0x04)
-			combo = 2;      /* d-pad left - previous */
-	}
-
-	if(combo && !XInputComboPrev)
-	{
-		if(combo == 1)
-		{
-			XInputProfile++;
-			if(XInputProfile >= XInputProfileCount)
-				XInputProfile = 0;
-		}
-		else
-		{
-			if(XInputProfile == 0)
-				XInputProfile = XInputProfileCount;
-			XInputProfile--;
-		}
-
-		memcpy(HID_CTRL, &XInputProfiles[XInputProfile], sizeof(controller));
-		sync_after_write(HID_CTRL, (sizeof(controller)+31)&(~31));
-		XInputSetLED(XInputProfile);
-		dbgprintf("HID:XInput profile %u\r\n", XInputProfile + 1);
-	}
-	XInputComboPrev = combo;
-
-	return back != 0;
-}
 /* Bring up the first XInput pad in the device list and start reading it. */
 static bool XInputOpen(void)
 {
@@ -1518,16 +1423,13 @@ static bool XInputOpen(void)
 
 		/* A matching .ini overrides the built-in mapping; otherwise the
 		 * protocol-defined layout is used, so any XInput pad works untouched. */
-		if(!HIDLoadControllerConfig(DeviceVID, DevicePID, 0, 1) ||
+		if(!HIDLoadControllerConfig(DeviceVID, DevicePID, 0) ||
 			HID_CTRL->VID != DeviceVID || HID_CTRL->PID != DevicePID)
 		{
 			dbgprintf("HID:XInput using built-in mapping\r\n");
 			XInputSetDefaultConfig(DeviceVID, DevicePID);
 		}
 
-		/* Pick up any numbered alternates now, while touching the filesystem
-		 * is still safe - the game is not streaming yet. */
-		XInputLoadProfiles(DeviceVID, DevicePID);
 
 		sync_after_write(HID_CTRL, (sizeof(controller)+31)&(~31));
 
@@ -1637,7 +1539,6 @@ static void XInputRead(void)
 	{
 		s16 rawlx, rawly, rawrx, rawry;
 		s16 lx, ly, rx, ry;
-		bool hideDpad = false;
 
 		XInputErrors = 0;
 
@@ -1687,12 +1588,8 @@ static void XInputRead(void)
 		 * interlock, so writing the axes in place would let it sample a report
 		 * whose stick bytes were still the raw halves of the 16 bit values.
 		 */
-		if(XInputCheckProfileCombo(XInputPacket))
-			hideDpad = true;
 
 		memcpy(XInputCooked, XInputPacket, XINPUT_REPORT_SIZE);
-		if(hideDpad)
-			XInputCooked[2] &= ~0x0F;
 		XInputCooked[6] = XInputNormalizeAxis(lx, false);
 		XInputCooked[7] = XInputNormalizeAxis(ly, true);
 		XInputCooked[8] = XInputNormalizeAxis(rx, false);
