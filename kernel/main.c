@@ -92,10 +92,21 @@ bool isWidescreen = false;
  * The XFB is YUY2 - Y0 Cb Y1 Cr, two bytes per pixel, 1280 bytes per line at
  * 640 pixels wide - so a 32-bit store covers two pixels.
  */
+/*
+ * Off by default. The drawing itself is proven - the block appears and the
+ * pointer decode is right - but polling fast enough to catch a buffer flip
+ * costs cache-maintenance syscalls in the kernel loop that services DI, and
+ * anything above roughly 30 wakeups a second has hung the game. Left in place
+ * because the groundwork holds; needs a cheaper way to know when a frame has
+ * flipped before it can be turned on.
+ */
+#define OSD_ENABLED     0
+
 #define OSD_XFB_SLOT    0x132C3000  /* PADRead writes VI_TFBL here every frame */
 #define OSD_LINE_BYTES  1280
 #define OSD_PIXEL_PAIR  0xEB80EB80  /* Y=0xEB Cb=0x80 Y=0xEB Cr=0x80: white */
 
+#if OSD_ENABLED
 static u32 OSD_Timer = 0;
 static u32 OSD_LastXFB = 0;
 static u32 OSD_Redraw = 0;
@@ -178,6 +189,7 @@ static void OSDUpdate(void)
 		sync_after_write((void*)line, 128);
 	}
 }
+#endif /* OSD_ENABLED */
 int _main( int argc, char *argv[] )
 {
 	//BSS is in DATA section so IOS doesnt touch it, we need to manually clear it
@@ -574,7 +586,9 @@ int _main( int argc, char *argv[] )
 		GCAMUpdateRegisters();
 		BTUpdateRegisters();
 		HIDUpdateRegisters(0);
+#if OSD_ENABLED
 		OSDUpdate();
+#endif
 		if(DisableSIPatch == 0) SIUpdateRegisters();
 		#endif
 		if(bbaEmuWanted)
