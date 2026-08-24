@@ -162,25 +162,15 @@ static void OSDUpdate(void)
 		return;
 
 	/*
-	 * Redraw on every flip, and otherwise every millisecond.
+	 * Draw once per flip. When VI_TFBL changes, a freshly rendered buffer has
+	 * just become visible and the game has moved on to the other one, so it is
+	 * finished, on screen, and untouched until the next flip - writing to it
+	 * now holds the overlay for the whole frame.
 	 *
-	 * Drawing once per flip is correct in principle - the buffer that just
-	 * became visible is finished and the game has moved to the other one - but
-	 * the box still flickered, because the gap between the flip happening and
-	 * this noticing it is a gap where the visible buffer has no overlay on it.
-	 * The kernel loop this runs from services DI, so its iterations are not
-	 * evenly spaced and that gap is sometimes long.
-	 *
-	 * Repainting every millisecond closes it: worst case the overlay is missing
-	 * for a millisecond out of a ~16 ms frame instead of however long the loop
-	 * took to come back around.
-	 *
-	 * Every rate limit derived earlier came from builds that also carried the
-	 * profile-loading bug, so none of them measured what they claimed to. This
-	 * is affordable now: one flush for the whole block instead of one per row
-	 * cuts the syscalls per repaint by eight.
+	 * The timer only covers single buffered games, where the address never
+	 * changes and there is no flip to key off.
 	 */
-	if(xfb == OSD_LastXFB && TimerDiffTicks(OSD_Redraw) < 1900)
+	if(xfb == OSD_LastXFB && TimerDiffTicks(OSD_Redraw) < 7600)
 		return;
 
 	OSD_LastXFB = xfb;
@@ -192,9 +182,8 @@ static void OSDUpdate(void)
 		u32 x;
 		for(x = 0; x < 64; x += 2)
 			write32(line + (x * 2), OSD_PIXEL_PAIR);
+		sync_after_write((void*)line, 128);
 	}
-	sync_after_write((void*)(xfb + (OSD_ROW_TOP * OSD_LINE_BYTES)),
-		OSD_ROWS * OSD_LINE_BYTES);
 }
 #endif /* OSD_ENABLED */
 int _main( int argc, char *argv[] )
