@@ -859,6 +859,16 @@ u32 PADRead(u32 calledByGame)
 
 		used |= (1<<chan);
 
+		/*
+		 * HOME quits back to the loader, whatever is plugged into the Wiimote.
+		 * The existing HOME checks all sit inside the nunchuk and classic
+		 * controller branches, so a bare Wiimote had no way out and the console
+		 * had to be power cycled. Checked here instead, before any of the
+		 * extension handling, so it works for every configuration.
+		 */
+		if(BTPad[chan].button & WM_BUTTON_HOME)
+			goto DoExit;
+
 		Rumble |= ((1<<31)>>chan);
 		BTMotor[chan] = MotorCommand[chan]&0x3;
 
