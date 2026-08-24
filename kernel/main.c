@@ -72,42 +72,57 @@ bool isWiiVC = false;
 bool wiiVCInternal = false;
 bool isWidescreen = false;
 /*
- * On-screen overlay, first milestone.
+ * On-screen overlay.
  *
- * Nintendont has no drawing code once a game is running: all of its UI is
- * GRRLIB in the PPC loader, which is gone by then. The per-frame PPC hook
- * (PADReadGC) can't take on drawing either - it is 11843 bytes into a hard
- * 12288 byte budget, and an 8x8 font alone is larger than what is left.
+ * Nintendont has no drawing code once a game is running - all of its UI is
+ * GRRLIB in the PPC loader, which is gone by then - and the per-frame PPC hook
+ * cannot take it on either: PADReadGC is 11867 bytes into a hard 12288 byte
+ * budget, and an 8x8 font alone is bigger than what is left.
  *
- * So the work is split. PADRead publishes VI_TFBL, which costs it two
- * instructions, and the ARM side - which has room - decodes that into the
- * game's external framebuffer and draws into it directly. The ARM already
- * writes MEM1 elsewhere (the OSReport area at 0x1860), so this is not new
- * ground.
+ * So the work is split. PADRead publishes VI_TFBL, costing it 24 bytes, and the
+ * ARM side decodes that into the game's external framebuffer and writes to it
+ * directly. The ARM already touches MEM1 elsewhere for the OSReport area.
  *
- * This milestone only proves the pointer is right and that writing to the
- * frame is safe: it paints one small block. Menus, fonts and input come later,
- * and only if this holds up on hardware.
+ * The hard part was not drawing, it was knowing *when*. Games are double
+ * buffered: VI_TFBL names the buffer being scanned out while the game renders
+ * the other one, so painting whichever happens to be up lands the overlay on
+ * about half the frames and it flickers. Catching the flip means noticing
+ * VI_TFBL change, which means polling faster than the frame - and earlier
+ * attempts spent a cache-invalidate syscall on every poll. That lands in the
+ * kernel loop which services DI while the game streams, and it does not
+ * survive it: ~30 polls a second ran fine, ~250 died shortly after drawing
+ * started, ~1000 died immediately.
  *
- * The XFB is YUY2 - Y0 Cb Y1 Cr, two bytes per pixel, 1280 bytes per line at
- * 640 pixels wide - so a 32-bit store covers two pixels.
+ * The fix is to make the poll free rather than rare. The kernel already reads
+ * PPC-written MEM2 with a plain load and no cache maintenance - MotorCommand
+ * at 0x13003020, read that way in HIDUpdateRegisters with the sync_before_read
+ * commented out, and shipped like that for years. Doing the same here reduces
+ * a poll to a single load, so it can run on every pass and catch the flip
+ * immediately. The PPC still writes through its uncached alias, so the value
+ * is guaranteed to reach memory.
+ *
+ * Failure mode if that assumption is ever wrong on some console: the ARM keeps
+ * reading a stale value, the address never appears to change, and the overlay
+ * simply does not draw. Nothing hangs.
+ *
+ * XFB is YUY2 - Y0 Cb Y1 Cr, two bytes per pixel - so one 32-bit store covers
+ * two pixels.
  */
-/*
- * Off by default. The drawing itself is proven - the block appears and the
- * pointer decode is right - but polling fast enough to catch a buffer flip
- * costs cache-maintenance syscalls in the kernel loop that services DI, and
- * anything above roughly 30 wakeups a second has hung the game. Left in place
- * because the groundwork holds; needs a cheaper way to know when a frame has
- * flipped before it can be turned on.
- */
-#define OSD_ENABLED     0
+#define OSD_ENABLED     1
 
 #define OSD_XFB_SLOT    0x132C3000  /* PADRead writes VI_TFBL here every frame */
 #define OSD_LINE_BYTES  1280
 #define OSD_PIXEL_PAIR  0xEB80EB80  /* Y=0xEB Cb=0x80 Y=0xEB Cr=0x80: white */
+#define OSD_ROW_TOP     32
+/*
+ * Eight rows, not sixteen. Each row costs a flush syscall, and drawing now
+ * happens once per flip - up to 60 times a second instead of the 30 that were
+ * known safe. Halving the rows keeps the syscall budget at roughly what was
+ * already proven to run indefinitely.
+ */
+#define OSD_ROWS        8
 
 #if OSD_ENABLED
-static u32 OSD_Timer = 0;
 static u32 OSD_LastXFB = 0;
 static u32 OSD_Redraw = 0;
 
@@ -116,7 +131,7 @@ static u32 OSDFramebuffer(void)
 {
 	u32 val, addr;
 
-	sync_before_read((void*)OSD_XFB_SLOT, 0x20);
+	/* Plain load, deliberately no cache maintenance - see the note above. */
 	val = read32(OSD_XFB_SLOT);
 	if(val == 0)
 		return 0;
@@ -127,9 +142,12 @@ static u32 OSDFramebuffer(void)
 	else
 		addr = val & 0x00FFFFFF;
 
-	/* Refuse anything that is not plausibly a framebuffer. Writing to a bad
-	 * address here would corrupt the running game. */
-	if(addr < 0x00010000 || addr >= 0x01800000 || (addr & 31))
+	/* Refuse anything not plausibly a framebuffer: a bad address here would
+	 * corrupt the running game. Check where the block ends, not just where the
+	 * buffer starts. */
+	if(addr < 0x00010000 || (addr & 31))
+		return 0;
+	if((addr + ((OSD_ROW_TOP + OSD_ROWS) * OSD_LINE_BYTES)) > 0x01800000)
 		return 0;
 
 	return addr;
@@ -139,48 +157,26 @@ static void OSDUpdate(void)
 {
 	u32 xfb, y;
 
-	/*
-	 * Cheap gate first: TimerDiffTicks is a bare register read, everything past
-	 * it costs syscalls, and this runs from the kernel loop that services DI and
-	 * streaming. Polling every pass (no gate) hung the game outright; 1 ms hung
-	 * it too. 4 ms is ~250 wakeups a second against the ~30 that were known
-	 * safe, and still catches a buffer flip well inside the frame it belongs to.
-	 */
-	if(TimerDiffTicks(OSD_Timer) < 7600)
-		return;
-	OSD_Timer = read32(HW_TIMER);
-
 	xfb = OSDFramebuffer();
 	if(xfb == 0)
 		return;
 
 	/*
-	 * Draw on the flip. Games are double buffered: VI_TFBL names the buffer
-	 * being scanned out while the game renders the other one, so painting
-	 * whichever happens to be up lands on about half the frames and flickers.
-	 * When VI_TFBL changes, a finished buffer has just gone on screen and the
-	 * game has moved on, so it stays untouched until the next flip.
+	 * Draw once per flip. When VI_TFBL changes, a freshly rendered buffer has
+	 * just become visible and the game has moved on to the other one, so it is
+	 * finished, on screen, and untouched until the next flip - writing to it
+	 * now holds the overlay for the whole frame.
 	 *
-	 * The second timer covers single buffered games, where the address never
+	 * The timer only covers single buffered games, where the address never
 	 * changes and there is no flip to key off.
 	 */
 	if(xfb == OSD_LastXFB && TimerDiffTicks(OSD_Redraw) < 30000)
 		return;
 
-	/* Refuse to draw if the block would run past the end of MEM1. */
-	if((xfb + (48 * OSD_LINE_BYTES)) > 0x01800000)
-		return;
-
 	OSD_LastXFB = xfb;
 	OSD_Redraw = read32(HW_TIMER);
 
-	/*
-	 * Flush per row, which is what was running when the game last booted
-	 * cleanly. Collapsing this into one 20 KB flush was part of the change that
-	 * started hanging it, so leave it alone until the overlay is otherwise
-	 * proven.
-	 */
-	for(y = 32; y < 48; ++y)
+	for(y = OSD_ROW_TOP; y < (OSD_ROW_TOP + OSD_ROWS); ++y)
 	{
 		u32 line = xfb + (y * OSD_LINE_BYTES) + (32 * 2);
 		u32 x;
