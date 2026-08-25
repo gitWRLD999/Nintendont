@@ -182,8 +182,8 @@ static void OSDUpdate(void)
 		u32 x;
 		for(x = 0; x < 64; x += 2)
 			write32(line + (x * 2), OSD_PIXEL_PAIR);
-		sync_after_write((void*)line, 128);
 	}
+	sync_after_write((void*)(xfb + (OSD_ROW_TOP * OSD_LINE_BYTES)), OSD_ROWS * OSD_LINE_BYTES);
 }
 #endif /* OSD_ENABLED */
 int _main( int argc, char *argv[] )
@@ -192,6 +192,20 @@ int _main( int argc, char *argv[] )
 	//dbgprintf("memset32(%08x, 0, %08x)\n", &__bss_start, &__bss_end - &__bss_start);
 	memset32(&__bss_start, 0, &__bss_end - &__bss_start);
 	sync_after_write(&__bss_start, &__bss_end - &__bss_start);
+
+	/*
+	 * Clear the slot PADRead publishes the framebuffer address into.
+	 *
+	 * MEM2 keeps its contents across a soft reset, so without this the overlay
+	 * reads a stale address left by the previous run and starts drawing into it
+	 * before the game has called PADRead even once - eight rows written to a
+	 * random place in MEM1 while the game is still loading. Whether that landed
+	 * somewhere harmful decided whether the boot succeeded, which is why the
+	 * same build booted some launches and black screened others, and why a whole
+	 * matrix of poll rates measured nothing but coin flips.
+	 */
+	write32(OSD_XFB_SLOT, 0);
+	sync_after_write((void*)OSD_XFB_SLOT, 0x20);
 
 	//Important to do this as early as possible
 	if(read32(0x20109740) == 0xE59F1004)

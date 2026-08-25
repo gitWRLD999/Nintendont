@@ -2,7 +2,7 @@
 #ifndef __META_DATA_H__
 #define __META_DATA_H__
 
-#define META_NAME			"Nintendont"
+#define META_NAME			"Nintendont OSD-E"
 #define META_AUTHOR			"FIX94, crediar"
 
 #define META_LONG1			"Commiters: GerbilSoft, JoostinOnline, GreyRogue, Howard, Cyan \r\n\r\n Project website: https://github.com/FIX94/Nintendont "
